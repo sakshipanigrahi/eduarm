@@ -1,0 +1,987 @@
+#include <stdint.h>
+#include <string.h>
+#include "inc/tm4c123gh6pm.h"
+
+/*
+=========================================================
+LAB 4 EXTENDED - STOPWATCH
+
+SW1 = PF4  (Tiva onboard switch, now INTERRUPT-driven)
+SW2 = PF0  (Tiva onboard switch, now INTERRUPT-driven)
+
+RGB LED:
+PF1 = RED
+PF2 = BLUE
+PF3 = GREEN
+
+7-SEGMENT:
+PA4 = Digit 1 (leftmost)
+PA5 = Digit 2
+PA6 = Digit 3
+PA7 = Digit 4 (rightmost)
+PB0-PB7 = segments (PB7 = decimal point)
+
+4x4 KEYPAD (EduARM4):
+PC4-PC7 = columns 0-3  (interrupt-driven, falling edge)
+PE0-PE3 = rows 0-3
+
+NORMAL SWITCH OPERATION (unchanged from Lab 4, now event-driven):
+SW1 alone       -> SPEED
+SW2 alone       -> COLOUR
+SW1 + SW2       -> RUN / PAUSE (of the RGB blink)
+
+STOPWATCH CONTROL - keypad key OR typed UART word does the SAME thing:
+  Keypad key 1 (row1,col1) / UART "enable" -> stopwatch ENABLE / DISABLE
+  Keypad key 2 (row1,col2) / UART "start"  -> stopwatch START / STOP(+reset)
+  Keypad key 3 (row1,col3) / UART "pause"  -> stopwatch PAUSE / RESUME
+
+DISPLAY:
+  Stopwatch DISABLED -> shows RGB status, exactly like Lab 4 (R/P, colour, S, speed)
+  Stopwatch ENABLED  -> shows stopwatch time as  SS.CC  (seconds . hundredths)
+    PA7:PA6 = seconds (decimal point lit on PA6), PA5:PA4 = hundredths
+
+UART (type the word, then press Enter):
+color / colour / c -> next colour   (wraps, same as SW2)
+rate / r            -> next speed    (wraps, same as SW1)
+t                   -> RUN / PAUSE the RGB blink
+enable / e          -> stopwatch ENABLE / DISABLE (toggle)
+disable / d         -> stopwatch DISABLE (forced, regardless of current state)
+start               -> stopwatch START / STOP(+reset)
+pause               -> stopwatch PAUSE / RESUME
+h                   -> HELP
+=========================================================
+*/
+
+/*=========================================================
+  7-SEGMENT CODES
+=========================================================*/
+uint8_t digitCode[10] =
+{
+    0x3F,   /* 0 */
+    0x06,   /* 1 */
+    0x5B,   /* 2 */
+    0x4F,   /* 3 */
+    0x66,   /* 4 */
+    0x6D,   /* 5 */
+    0x7D,   /* 6 */
+    0x07,   /* 7 */
+    0x7F,   /* 8 */
+    0x6F    /* 9 */
+};
+
+#define SEG_P       0x73    /* looks like the letter "P" (Pause) */
+#define SEG_R       0x77    /* looks like the letter "r" (running) */
+#define SEG_S       0x6D    /* looks like the letter "S" (Speed label) */
+#define SEG_OFF     0x00    /* all segments off (blank digit) */
+
+/*=========================================================
+  GLOBAL (file-scope) VARIABLES
+  ---------------------------------------------------------
+  WHY GLOBAL: an interrupt handler is its own separate
+  function. It cannot see or touch variables that live
+  INSIDE main() (those only exist on main's own private
+  stack). So anything that BOTH main() and an interrupt
+  handler need to read or write has to live here, at file
+  scope, instead of being declared inside main().
+
+  WHY volatile: this tells the compiler "this variable can
+  change at any moment, from an interrupt, without any
+  line of code around it changing it - so do NOT optimise
+  away repeated reads of it, always fetch the real value".
+=========================================================*/
+volatile uint8_t colour = 1;        /* 0=OFF,1-7=colours, same as Lab4 */
+volatile uint8_t speed  = 1;        /* 1-8, same as Lab4               */
+volatile uint8_t state  = 0;        /* 0=blinking RGB, 1=continuous ON */
+
+volatile uint32_t ms_ticks   = 0;   /* free-running millisecond clock  */
+volatile uint32_t stopwatchMs = 0;  /* stopwatch elapsed time, in ms   */
+
+volatile uint8_t stopwatchEnabled = 0;
+volatile uint8_t stopwatchRunning = 0;
+volatile uint8_t stopwatchPaused  = 0;
+
+volatile uint8_t keypadEvent = 0;   /* set by GPIOPortC_Handler,
+                                        cleared once main() has
+                                        finished handling the key   */
+
+/*=========================================================
+  DELAY
+=========================================================*/
+void delay(void)
+{
+    volatile uint32_t i;
+    for(i = 0; i < 1000; i++)
+    {
+        /* intentionally empty - just counting time */
+    }
+}
+
+/*=========================================================
+  TURN OFF ALL 7-SEGMENT DIGITS
+=========================================================*/
+void digitsOff(void)
+{
+    GPIO_PORTA_DATA_R &= ~0xF0;
+}
+
+/*=========================================================
+  SHOW ONE DIGIT
+  ---------------------------------------------------------
+  dp = 1 lights the decimal point segment (PB7) alongside
+  this digit's pattern. dp = 0 leaves it off. This is the
+  only change from the Lab 4 version of this function - one
+  extra parameter, same behaviour as before when dp = 0.
+=========================================================*/
+void showDigit(uint8_t digit, uint8_t pattern, uint8_t dp)
+{
+    digitsOff();
+
+    if(dp == 1)
+    {
+        GPIO_PORTB_DATA_R = pattern | 0x80;
+    }
+    else
+    {
+        GPIO_PORTB_DATA_R = pattern;
+    }
+
+    if(digit == 0)
+    {
+        GPIO_PORTA_DATA_R |= 0x10;
+    }
+    else if(digit == 1)
+    {
+        GPIO_PORTA_DATA_R |= 0x20;
+    }
+    else if(digit == 2)
+    {
+        GPIO_PORTA_DATA_R |= 0x40;
+    }
+    else
+    {
+        GPIO_PORTA_DATA_R |= 0x80;
+    }
+
+    delay();
+
+    digitsOff();
+}
+
+/*=========================================================
+  RGB COLOUR
+  0 = OFF, 1 = RED, 2 = BLUE, 3 = GREEN, 4 = MAGENTA,
+  5 = YELLOW, 6 = CYAN, 7 = WHITE
+=========================================================*/
+void setColour(uint8_t c)
+{
+    if(c == 0)
+    {
+        GPIO_PORTF_DATA_R &= ~0x0E;
+    }
+    else if(c == 1)
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x02;
+    }
+    else if(c == 2)
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x04;
+    }
+    else if(c == 3)
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x08;
+    }
+    else if(c == 4)
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x06;
+    }
+    else if(c == 5)
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x0A;
+    }
+    else if(c == 6)
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x0C;
+    }
+    else
+    {
+        GPIO_PORTF_DATA_R = (GPIO_PORTF_DATA_R & ~0x0E) | 0x0E;
+    }
+}
+
+/*=========================================================
+  NORMAL (RGB STATUS) DISPLAY - unchanged from Lab 4
+  Digit 1 = R/P, Digit 2 = colour, Digit 3 = S, Digit 4 = speed
+=========================================================*/
+void updateDisplay(uint8_t st, uint8_t col, uint8_t sp)
+{
+    if(st == 0)
+    {
+        showDigit(0, SEG_R, 0);
+    }
+    else
+    {
+        showDigit(0, SEG_P, 0);
+    }
+
+    showDigit(1, digitCode[col], 0);
+    showDigit(2, digitCode[sp], 0);
+    showDigit(3, SEG_S, 0);
+}
+
+/*=========================================================
+  STOPWATCH DISPLAY
+  ---------------------------------------------------------
+  Shows stopwatchMs as  SS.CC  (seconds . hundredths):
+    PA7 = seconds tens
+    PA6 = seconds units   (decimal point lit here)
+    PA5 = hundredths tens
+    PA4 = hundredths units
+  (digit index 3=PA7, 2=PA6, 1=PA5, 0=PA4, per showDigit())
+=========================================================*/
+void updateStopwatchDisplay(void)
+{
+    uint32_t snapshot;
+    uint8_t seconds;
+    uint8_t centiseconds;
+
+    /* copy the volatile value once, so all four digits below
+       are guaranteed to show the SAME instant in time, even
+       though stopwatchMs could change again a moment later   */
+    snapshot = stopwatchMs;
+
+    seconds      = (snapshot / 1000);
+    centiseconds = (snapshot % 1000) / 10;
+
+    showDigit(3, digitCode[seconds / 10], 0);          /* PA7 */
+    showDigit(2, digitCode[seconds % 10], 1);           /* PA6, dp = 1 */
+    showDigit(1, digitCode[centiseconds / 10], 0);      /* PA5 */
+    showDigit(0, digitCode[centiseconds % 10], 0);      /* PA4 */
+}
+
+/*=========================================================
+  UART0 INITIALIZATION - 16 MHz clock, 115200 baud
+=========================================================*/
+void UART0_Init(void)
+{
+    SYSCTL_RCGCUART_R |= 0x01;
+    SYSCTL_RCGCGPIO_R |= 0x01;
+
+    while((SYSCTL_PRGPIO_R & 0x01) == 0)
+    {
+    }
+
+    GPIO_PORTA_AFSEL_R |= 0x03;
+    GPIO_PORTA_PCTL_R &= ~0xFF;
+    GPIO_PORTA_PCTL_R |= 0x11;
+    GPIO_PORTA_DEN_R |= 0x03;
+
+    UART0_CTL_R = 0;
+    UART0_IBRD_R = 8;
+    UART0_FBRD_R = 44;
+    UART0_LCRH_R = 0x70;
+    UART0_CTL_R = 0x301;
+}
+
+/*=========================================================
+  UART READ - blocks (busy-waits) until one character arrives
+=========================================================*/
+char UART0_Read(void)
+{
+    while(UART0_FR_R & 0x10)
+    {
+    }
+
+    return UART0_DR_R & 0xFF;
+}
+
+/*=========================================================
+  UART WRITE - blocks until there's room, then sends one char
+=========================================================*/
+void UART0_Write(char c)
+{
+    while(UART0_FR_R & 0x20)
+    {
+    }
+
+    UART0_DR_R = c;
+}
+
+/*=========================================================
+  UART STRING - sends a whole C string, char by char
+=========================================================*/
+void UART0_String(char *str)
+{
+    while(*str)
+    {
+        UART0_Write(*str);
+        str++;
+    }
+}
+
+/*=========================================================
+  STOPWATCH ACTIONS
+  ---------------------------------------------------------
+  These three functions are the ONLY place that changes
+  stopwatchEnabled / stopwatchRunning / stopwatchPaused.
+  Both the keypad handler (keypadService) and the typed
+  UART command handler (processCommand) call these SAME
+  three functions, so "press key 1" and "type enable" are
+  guaranteed to behave identically - no duplicated logic.
+=========================================================*/
+void stopwatchEnableDisable(void)
+{
+    if(stopwatchEnabled == 0)
+    {
+        stopwatchEnabled = 1;
+        stopwatchRunning = 0;
+        stopwatchPaused = 0;
+        stopwatchMs = 0;
+        UART0_String("\r\nStopwatch Enabled\r\n");
+    }
+    else
+    {
+        stopwatchEnabled = 0;
+        stopwatchRunning = 0;
+        stopwatchPaused = 0;
+        stopwatchMs = 0;
+        UART0_String("\r\nStopwatch Disabled\r\n");
+    }
+}
+
+void stopwatchStartStop(void)
+{
+    if(stopwatchEnabled == 0)
+    {
+        UART0_String("\r\nStopwatch is disabled\r\n");
+    }
+    else if(stopwatchRunning == 0)
+    {
+        stopwatchMs = 0;
+        stopwatchRunning = 1;
+        stopwatchPaused = 0;
+        UART0_String("\r\nStopwatch Started\r\n");
+    }
+    else
+    {
+        stopwatchMs = 0;
+        stopwatchRunning = 0;
+        stopwatchPaused = 0;
+        UART0_String("\r\nStopwatch Stopped\r\n");
+    }
+}
+
+void stopwatchPauseResume(void)
+{
+    if((stopwatchEnabled == 0) || (stopwatchRunning == 0))
+    {
+        UART0_String("\r\nStart the stopwatch first\r\n");
+    }
+    else if(stopwatchPaused == 0)
+    {
+        stopwatchPaused = 1;
+        UART0_String("\r\nStopwatch Paused\r\n");
+    }
+    else
+    {
+        stopwatchPaused = 0;
+        UART0_String("\r\nStopwatch Resumed\r\n");
+    }
+}
+
+/*=========================================================
+  PROCESS UART COMMAND
+=========================================================*/
+void processCommand(char *word)
+{
+    /* skip past any leading spaces - so " rate" or "   c" are
+       treated exactly the same as "rate" or "c"               */
+    while(*word == ' ')
+    {
+        word++;
+    }
+
+    if((strcmp(word, "color") == 0) || (strcmp(word, "colour") == 0) || (strcmp(word, "c") == 0))
+    {
+        colour++;
+        if(colour > 7)
+        {
+            colour = 0;
+        }
+        UART0_String("\r\nColour incremented\r\n");
+    }
+    else if((strcmp(word, "rate") == 0) || (strcmp(word, "r") == 0))
+    {
+        speed++;
+        if(speed > 8)
+        {
+            speed = 1;
+        }
+        UART0_String("\r\nRate incremented\r\n");
+    }
+    else if(strcmp(word, "t") == 0)
+    {
+        if(state == 0)
+        {
+            state = 1;
+            UART0_String("\r\nLED: CONTINUOUS ON\r\n");
+        }
+        else
+        {
+            state = 0;
+            UART0_String("\r\nLED: BLINKING\r\n");
+        }
+    }
+    else if((strcmp(word, "enable") == 0) || (strcmp(word, "e") == 0))
+    {
+        stopwatchEnableDisable();
+    }
+    else if((strcmp(word, "disable") == 0) || (strcmp(word, "d") == 0))
+    {
+        /* explicit, unconditional disable - regardless of the
+           current state, unlike "enable" which just toggles     */
+        stopwatchEnabled = 0;
+        stopwatchRunning = 0;
+        stopwatchPaused = 0;
+        stopwatchMs = 0;
+        UART0_String("\r\nStopwatch Disabled\r\n");
+    }
+    else if(strcmp(word, "start") == 0)
+    {
+        stopwatchStartStop();
+    }
+    else if(strcmp(word, "pause") == 0)
+    {
+        stopwatchPauseResume();
+    }
+    else if(strcmp(word, "h") == 0)
+    {
+        UART0_String(
+            "\r\n"
+            "============================\r\n"
+            "LAB 4 EXTENDED - COMMANDS\r\n"
+            "============================\r\n"
+            "color / colour / c = next colour\r\n"
+            "rate / r       = next speed\r\n"
+            "t              = BLINK/CONTINUOUS\r\n"
+            "enable / e     = stopwatch ENABLE/DISABLE (toggle)\r\n"
+            "disable / d    = stopwatch DISABLE (forced)\r\n"
+            "start          = stopwatch START/STOP\r\n"
+            "pause          = stopwatch PAUSE/RESUME\r\n"
+            "h              = HELP\r\n"
+            "============================\r\n"
+        );
+    }
+    else
+    {
+        UART0_String("\r\nUnknown command\r\n");
+    }
+}
+
+/*=========================================================
+  KEYPAD SCAN
+  ---------------------------------------------------------
+  PE0-PE3 = rows 0-3, PC4-PC7 = columns 0-3 (as bits 4-7)
+  Drives one row LOW at a time, reads which column pulled
+  LOW in response. Returns key number 1-16, or 0 if none.
+=========================================================*/
+uint8_t keypadScan(void)
+{
+    uint8_t row;
+    uint8_t columns;
+    uint8_t key;
+
+    key = 0;
+
+    for(row = 0; row < 4; row++)
+    {
+        GPIO_PORTE_DATA_R |= 0x0F;
+        GPIO_PORTE_DATA_R &= ~(1 << row);
+
+        delay();
+
+        columns = GPIO_PORTC_DATA_R & 0xF0;
+
+        if(columns == 0xE0)
+        {
+            key = (row * 4) + 1;
+        }
+        else if(columns == 0xD0)
+        {
+            key = (row * 4) + 2;
+        }
+        else if(columns == 0xB0)
+        {
+            key = (row * 4) + 3;
+        }
+        else if(columns == 0x70)
+        {
+            key = (row * 4) + 4;
+        }
+
+        if(key != 0)
+        {
+            break;
+        }
+    }
+
+    GPIO_PORTE_DATA_R &= ~0x0F;
+
+    return key;
+}
+
+/*=========================================================
+  KEYPAD SERVICE - called every pass of the main loop.
+  ---------------------------------------------------------
+  Only does anything when GPIOPortC_Handler has set
+  keypadEvent = 1 (i.e. a key was actually pressed).
+  This is the "interrupt wakes me up, main loop figures
+  out the details" pattern: the ISR itself stays very
+  short, all the row/column scanning happens safely here.
+
+  NOTE: the while() below blocks main() until the key is
+  released, so the display/UART will briefly pause while a
+  key is held down. That is a known simplification for this
+  first version - fine for now, worth revisiting once we
+  get to debouncing.
+=========================================================*/
+void keypadService(void)
+{
+    uint8_t key;
+
+    if(keypadEvent == 1)
+    {
+        key = keypadScan();
+
+        if(key == 1)
+        {
+            stopwatchEnableDisable();
+        }
+        else if(key == 2)
+        {
+            stopwatchStartStop();
+        }
+        else if(key == 3)
+        {
+            stopwatchPauseResume();
+        }
+
+        while((GPIO_PORTC_DATA_R & 0xF0) != 0xF0)
+        {
+            /* wait here until every column reads released (HIGH)
+               so a held key does not fire the action repeatedly */
+        }
+
+        GPIO_PORTC_ICR_R = 0xF0;
+        GPIO_PORTC_IM_R |= 0xF0;
+        keypadEvent = 0;
+    }
+}
+
+/*=========================================================
+  SYSTICK INTERRUPT HANDLER
+  ---------------------------------------------------------
+  Fires automatically every 1 ms (configured in main()).
+  This is the stopwatch's clock: every tick, if the
+  stopwatch is enabled + running + not paused, add 1 ms
+  to stopwatchMs. Wraps back to 0 after 59.99 seconds.
+=========================================================*/
+void SysTick_Handler(void)
+{
+    ms_ticks++;
+
+    if((stopwatchEnabled == 1) &&
+       (stopwatchRunning == 1) &&
+       (stopwatchPaused == 0))
+    {
+        stopwatchMs++;
+
+        if(stopwatchMs >= 60000)
+        {
+            stopwatchMs = 0;
+        }
+    }
+}
+
+/*=========================================================
+  GPIO PORT F INTERRUPT HANDLER - onboard SW1 (PF4) / SW2 (PF0)
+  ---------------------------------------------------------
+  Fires on EVERY press AND release of either switch (both
+  edges are armed in main()). The decision logic below is
+  EXACTLY the same as the Lab 4 polling version - the only
+  difference is that it now runs once per actual switch
+  event, instead of being re-checked every main loop pass.
+
+  oldSW1/oldSW2 are "static", which means (unlike a normal
+  local variable) they keep their value between one call of
+  this function and the next - they act as this function's
+  own private memory of "what was the switch doing last
+  time I ran?".
+=========================================================*/
+void GPIOPortF_Handler(void)
+{
+    static uint8_t oldSW1 = 1;
+    static uint8_t oldSW2 = 1;
+    uint8_t sw1;
+    uint8_t sw2;
+
+    GPIO_PORTF_ICR_R = 0x11;
+
+    sw1 = GPIO_PORTF_DATA_R & 0x10;
+    sw2 = GPIO_PORTF_DATA_R & 0x01;
+
+    if((sw1 == 0) && (sw2 == 0))
+    {
+        if((oldSW1 != 0) || (oldSW2 != 0))
+        {
+            if(state == 0)
+            {
+                state = 1;
+            }
+            else
+            {
+                state = 0;
+            }
+        }
+    }
+    else if((state == 0) && (sw1 == 0) && (oldSW1 != 0))
+    {
+        speed++;
+        if(speed > 8)
+        {
+            speed = 1;
+        }
+    }
+    else if((state == 0) && (sw2 == 0) && (oldSW2 != 0))
+    {
+        colour++;
+        if(colour > 7)
+        {
+            colour = 0;
+        }
+    }
+
+    oldSW1 = sw1;
+    oldSW2 = sw2;
+}
+
+/*=========================================================
+  GPIO PORT C INTERRUPT HANDLER - keypad columns (PC4-PC7)
+  ---------------------------------------------------------
+  Kept deliberately tiny: just notice that SOMETHING was
+  pressed, mask further keypad interrupts so it can't fire
+  again mid-scan, and set a flag. keypadService() (called
+  from main()) does the real work.
+=========================================================*/
+void GPIOPortC_Handler(void)
+{
+    uint32_t triggered;
+
+    triggered = GPIO_PORTC_MIS_R & 0xF0;
+
+    if(triggered != 0)
+    {
+        GPIO_PORTC_ICR_R = triggered;
+        GPIO_PORTC_IM_R &= ~0xF0;
+        keypadEvent = 1;
+    }
+}
+
+/*=========================================================
+  MAIN
+=========================================================*/
+int main(void)
+{
+    uint8_t ledState = 1;
+    uint32_t counter = 0;
+    uint32_t blinkCount;
+    char command;
+
+    char cmdBuffer[16];
+    uint8_t cmdIndex = 0;
+
+    /*=====================================================
+      ENABLE PORT F
+    =====================================================*/
+    SYSCTL_RCGCGPIO_R |= 0x20;
+    while((SYSCTL_PRGPIO_R & 0x20) == 0)
+    {
+    }
+
+    /*=====================================================
+      ENABLE PORT A
+    =====================================================*/
+    SYSCTL_RCGCGPIO_R |= 0x01;
+    while((SYSCTL_PRGPIO_R & 0x01) == 0)
+    {
+    }
+
+    /*=====================================================
+      ENABLE PORT B
+    =====================================================*/
+    SYSCTL_RCGCGPIO_R |= 0x02;
+    while((SYSCTL_PRGPIO_R & 0x02) == 0)
+    {
+    }
+
+    /*=====================================================
+      ENABLE PORT C  (keypad columns)
+    =====================================================*/
+    SYSCTL_RCGCGPIO_R |= 0x04;
+    while((SYSCTL_PRGPIO_R & 0x04) == 0)
+    {
+    }
+
+    /*=====================================================
+      ENABLE PORT E  (keypad rows)
+    =====================================================*/
+    SYSCTL_RCGCGPIO_R |= 0x10;
+    while((SYSCTL_PRGPIO_R & 0x10) == 0)
+    {
+    }
+
+    /*=====================================================
+      UNLOCK PF0
+    =====================================================*/
+    GPIO_PORTF_LOCK_R = 0x4C4F434B;
+    GPIO_PORTF_CR_R |= 0x01;
+
+    /*=====================================================
+      PORT F - RGB outputs, SW1/SW2 inputs with pull-ups
+    =====================================================*/
+    GPIO_PORTF_DIR_R |= 0x0E;
+    GPIO_PORTF_DIR_R &= ~0x11;
+    GPIO_PORTF_DEN_R |= 0x1F;
+    GPIO_PORTF_PUR_R |= 0x11;
+
+    /* PF0 (SW2) and PF4 (SW1): edge-sensitive, BOTH edges,
+       so we catch press AND release                        */
+    GPIO_PORTF_IS_R  &= ~0x11;
+    GPIO_PORTF_IBE_R |= 0x11;
+    GPIO_PORTF_ICR_R  = 0x11;
+    GPIO_PORTF_IM_R  |= 0x11;
+
+    /*=====================================================
+      PORT A - 7-seg digit select
+    =====================================================*/
+    GPIO_PORTA_DIR_R |= 0xF0;
+    GPIO_PORTA_DEN_R |= 0xF0;
+
+    /*=====================================================
+      PORT B - 7-seg segments
+    =====================================================*/
+    GPIO_PORTB_DIR_R |= 0xFF;
+    GPIO_PORTB_DEN_R |= 0xFF;
+
+    /*=====================================================
+      PORT C - keypad columns (inputs, pull-ups, interrupt)
+    =====================================================*/
+    GPIO_PORTC_DIR_R &= ~0xF0;
+    GPIO_PORTC_DEN_R |= 0xF0;
+    GPIO_PORTC_PUR_R |= 0xF0;
+
+    /* PC4-PC7: edge-sensitive, single edge, FALLING edge     */
+    GPIO_PORTC_IS_R  &= ~0xF0;
+    GPIO_PORTC_IBE_R &= ~0xF0;
+    GPIO_PORTC_IEV_R &= ~0xF0;
+    GPIO_PORTC_ICR_R  = 0xF0;
+    GPIO_PORTC_IM_R  |= 0xF0;
+
+    /*=====================================================
+      PORT E - keypad rows (outputs, open-drain, driven LOW)
+    =====================================================*/
+    GPIO_PORTE_DIR_R |= 0x0F;
+    GPIO_PORTE_DEN_R |= 0x0F;
+    GPIO_PORTE_ODR_R |= 0x0F;
+    GPIO_PORTE_DATA_R &= ~0x0F;
+
+    /*=====================================================
+      NVIC - enable GPIO Port F (IRQ30) and Port C (IRQ2)
+    =====================================================*/
+    NVIC_EN0_R |= (1 << 30);
+    NVIC_EN0_R |= (1 << 2);
+
+    /*=====================================================
+      SYSTICK - 16 MHz clock, 1 ms period
+    =====================================================*/
+    NVIC_ST_CTRL_R = 0;
+    NVIC_ST_RELOAD_R = 15999;
+    NVIC_ST_CURRENT_R = 0;
+    NVIC_ST_CTRL_R = 0x07;
+
+    /*=====================================================
+      UART
+    =====================================================*/
+    UART0_Init();
+
+    /*=====================================================
+      ENABLE GLOBAL INTERRUPTS
+      Nothing above this line will actually fire until this
+      runs - SysTick/Port F/Port C are "armed" but masked
+      at the CPU level until cpsie i.
+    =====================================================*/
+    __asm("cpsie i");
+
+    UART0_String(
+        "\r\n"
+        "============================\r\n"
+        "     LAB 4 EXTENDED\r\n"
+        "============================\r\n"
+        "SW1       : SPEED\r\n"
+        "SW2       : COLOUR\r\n"
+        "SW1+SW2   : RUN / PAUSE\r\n"
+        "Keypad 1  : Stopwatch ENABLE/DISABLE\r\n"
+        "Keypad 2  : Stopwatch START/STOP\r\n"
+        "Keypad 3  : Stopwatch PAUSE/RESUME\r\n"
+        "\r\n"
+        "UART COMMANDS (type then Enter):\r\n"
+        "color / colour = next colour\r\n"
+        "rate           = next speed\r\n"
+        "t              = BLINK / CONTINUOUS\r\n"
+        "enable / start / pause = stopwatch controls\r\n"
+        "h              = HELP\r\n"
+        "============================\r\n"
+    );
+
+    setColour(colour);
+
+    /*=====================================================
+      MAIN LOOP
+    =====================================================*/
+    while(1)
+    {
+        /*=================================================
+          UART / LAPTOP INPUT
+        =================================================*/
+        if((UART0_FR_R & 0x10) == 0)
+        {
+            command = UART0_Read();
+
+            if((command == '\r') || (command == '\n'))
+            {
+                if(cmdIndex > 0)
+                {
+                    char *trimmed;
+                    uint8_t trimLen;
+
+                    cmdBuffer[cmdIndex] = '\0';
+
+                    /* skip any leading spaces typed before the word */
+                    trimmed = cmdBuffer;
+                    while(*trimmed == ' ')
+                    {
+                        trimmed++;
+                    }
+
+                    /* drop any trailing spaces typed after the word */
+                    trimLen = strlen(trimmed);
+                    while((trimLen > 0) && (trimmed[trimLen - 1] == ' '))
+                    {
+                        trimLen--;
+                    }
+                    trimmed[trimLen] = '\0';
+
+                    processCommand(trimmed);
+                }
+
+                cmdIndex = 0;
+                UART0_String("\r\n");
+            }
+            else if(cmdIndex < (sizeof(cmdBuffer) - 1))
+            {
+                cmdBuffer[cmdIndex] = command;
+                cmdIndex++;
+                UART0_Write(command);
+            }
+        }
+
+        /*=================================================
+          KEYPAD (interrupt-flagged, polled here)
+        =================================================*/
+        keypadService();
+
+        /*=================================================
+          SPEED SETTINGS
+        =================================================*/
+        if(speed == 1)
+        {
+            blinkCount = 160;
+        }
+        else if(speed == 2)
+        {
+            blinkCount = 130;
+        }
+        else if(speed == 3)
+        {
+            blinkCount = 100;
+        }
+        else if(speed == 4)
+        {
+            blinkCount = 80;
+        }
+        else if(speed == 5)
+        {
+            blinkCount = 60;
+        }
+        else if(speed == 6)
+        {
+            blinkCount = 45;
+        }
+        else if(speed == 7)
+        {
+            blinkCount = 30;
+        }
+        else
+        {
+            blinkCount = 15;
+        }
+
+        /*=================================================
+          RGB LED CONTROL
+        =================================================*/
+        if(state == 0)
+        {
+            if(counter >= blinkCount)
+            {
+                counter = 0;
+                if(ledState == 0)
+                {
+                    ledState = 1;
+                }
+                else
+                {
+                    ledState = 0;
+                }
+            }
+
+            if(ledState == 1)
+            {
+                setColour(colour);
+            }
+            else
+            {
+                GPIO_PORTF_DATA_R &= ~0x0E;
+            }
+        }
+        else
+        {
+            setColour(colour);
+            ledState = 1;
+        }
+
+        /*=================================================
+          7-SEGMENT DISPLAY
+          Enabled  -> stopwatch time
+          Disabled -> RGB status (exactly like Lab 4)
+        =================================================*/
+        if(stopwatchEnabled == 1)
+        {
+            updateStopwatchDisplay();
+        }
+        else
+        {
+            updateDisplay(state, colour, speed);
+        }
+
+        counter++;
+    }
+}
